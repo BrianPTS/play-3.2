@@ -64,12 +64,24 @@ class DatabaseManager {
           },
         };
 
+        // Calculate venue availability percentage
+        const venueCapacity = scrapeResult.venueCapacity || 0;
+        const availabilityPercentage = venueCapacity > 0
+          ? Math.round((currentTicketCount / venueCapacity) * 100)
+          : null;
+
+        if (venueCapacity > 0) {
+          console.log(`[Availability ${eventId}] ${currentTicketCount}/${venueCapacity} seats available (${availabilityPercentage}%)`);
+        }
+
         // First update the basic event info
         await Event.updateOne(
           { Event_ID: eventId },
           {
             $set: {
               Available_Seats: currentTicketCount,
+              Venue_Capacity: venueCapacity,
+              Availability_Percentage: availabilityPercentage,
               Last_Updated: new Date(),
               "metadata.basic": metadata,
             },

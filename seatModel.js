@@ -2,6 +2,13 @@ import moment from "moment";
 import * as fs from "fs";
 // Function to generate unique 10-digit inventory ID
 
+// Section Density Filter Configuration
+const DENSITY_FILTERS = {
+  sectionDensityThreshold: 0.10,       // Exclude sections below 10% availability
+  sectionDensityMinCapacity: 50,        // Skip sections smaller than 50 seats from density check
+  sectionDensityHighValueThreshold: 1000, // Never exclude listings at or above $1000/ticket
+};
+
 // Global Filters
 const GLOBAL_FILTERS = {
   inventoryType: [
@@ -728,11 +735,53 @@ export const AttachRowSection = (
       return !hasDuplicate || index === 0; // Keep the first object or objects without duplicates
     });
 
-  // fs.writeFileSync(`debug/seatBatch_${event.eventId}.json`, JSON.stringify(finalData, null, 2));
+  // ── Section Density Filter ──
+  // Calculate per-section availability from the full venue map (allAvailableSeats)
+  // vs the facets data (what's actually listed for sale).
+  // Exclude sections where available/total < threshold, unless listing is high-value.
+  const venueCapacity = allAvailableSeats.length;
 
-  // // Debug: Final processed data after all filters
-  // fs.writeFileSync(`debug/finalProcessed_${event.eventId}.json`, JSON.stringify(finalData, null, 2));
-  // console.log(`Final processed data written to debug/finalProcessed_${event.eventId}.json - Total items: ${finalData.length}`);
+  // Build section capacity map from the full venue map
+  const sectionCapacityMap = {};
+  for (const seat of allAvailableSeats) {
+    sectionCapacityMap[seat.section] = (sectionCapacityMap[seat.section] || 0) + 1;
+  }
 
-  return finalData;
+  // Build section available map from the filtered listings
+  const sectionAvailableMap = {};
+  for (const item of finalData) {
+    const sec = item.section;
+    const qty = item.inventory?.quantity || item.seats?.length || 0;
+    sectionAvailableMap[sec] = (sectionAvailableMap[sec] || 0) + qty;
+  }
+
+  // Determine which sections to exclude based on density
+  const excludedSections = new Set();
+  for (const [section, totalSeats] of Object.entries(sectionCapacityMap)) {
+    if (totalSeats < DENSITY_FILTERS.sectionDensityMinCapacity) continue; // skip small sections
+    const available = sectionAvailableMap[section] || 0;
+    const density = available / totalSeats;
+    if (density < DENSITY_FILTERS.sectionDensityThreshold) {
+      excludedSections.add(section);
+      console.log(`[DensityFilter ${event.eventId || ''}] Excluding section "${section}": ${available}/${totalSeats} available (${(density * 100).toFixed(1)}% < ${DENSITY_FILTERS.sectionDensityThreshold * 100}% threshold)`);
+    }
+  }
+
+  // Apply density filter — keep high-value listings even in excluded sections
+  let filteredData = finalData;
+  if (excludedSections.size > 0) {
+    filteredData = finalData.filter((item) => {
+      if (!excludedSections.has(item.section)) return true;
+      // Check if this is a high-value listing (cost per ticket >= threshold)
+      const costPerTicket = item.inventory?.cost || 0;
+      if (costPerTicket >= DENSITY_FILTERS.sectionDensityHighValueThreshold) {
+        console.log(`[DensityFilter ${event.eventId || ''}] Keeping high-value listing in excluded section "${item.section}": $${costPerTicket.toFixed(2)}/ticket >= $${DENSITY_FILTERS.sectionDensityHighValueThreshold} threshold`);
+        return true;
+      }
+      return false;
+    });
+    console.log(`[DensityFilter ${event.eventId || ''}] Density filter removed ${finalData.length - filteredData.length} listings from ${excludedSections.size} sparse sections`);
+  }
+
+  return { listings: filteredData, venueCapacity };
 };

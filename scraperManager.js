@@ -1022,19 +1022,28 @@ async function callTicketmasterAPI(facetHeader, proxyAgent, eventId, event, mapH
 
     // Handle the case where we have partial data
     try {
-      const result = AttachRowSection(
+      const seatBatchResult = AttachRowSection(
         DataFacets ? GenerateNanoPlaces(DataFacets?.facets) : [],
         DataMap || {},
         DataFacets?._embedded?.offer || [],
         { eventId, inHandDate: event?.inHandDate },
         DataFacets?._embedded?.description || {}
       );
-      
+
+      // AttachRowSection now returns { listings, venueCapacity }
+      const result = seatBatchResult.listings;
+      const venueCapacity = seatBatchResult.venueCapacity || 0;
+
+      // Attach venueCapacity to the result array so downstream (Items.js) can access it
+      if (result) {
+        result.venueCapacity = venueCapacity;
+      }
+
       // Validate result - null or empty results should not be considered successful scrape
       if (!result || !Array.isArray(result) || result.length === 0) {
         throw new Error(`Event ${eventId} scrape validation failed - no valid seats found. Result: ${result ? 'empty array' : 'null/undefined'}`);
       }
-      
+
       // SEAT COUNT VALIDATION - Check for suspicious fluctuations
       const seatCount = result.length;
       const validation = await seatValidator.validateSeatCount(eventId, seatCount);
