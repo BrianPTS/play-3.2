@@ -1,0 +1,1812 @@
+import {devices } from "patchright";
+import fs from "fs/promises";
+import path from "path";
+import { chromium } from 'patchright'
+
+import { BrowserFingerprint } from "./browserFingerprint.js";
+import proxyArray from "./helpers/proxy.js";
+// Device settings
+const iphone13 = devices["iPhone 13"];
+
+// Constants
+const COOKIES_FILE = "cookies.json";
+
+// Persistent browser context for API requests (bypasses TLS fingerprinting)
+let apiBrowser = null;
+let apiContext = null;
+let apiPage = null;
+let apiContextLock = false;
+const CONFIG = {
+  COOKIE_REFRESH_INTERVAL: 45 * 60 * 1000, // 45 minutes
+  PAGE_TIMEOUT: 90000, // 60 seconds for page operations
+  MAX_RETRIES: 5, // Reduced from 5 to fail faster
+  RETRY_DELAY: 8000, // Reduced from 10s to 8s
+  CHALLENGE_TIMEOUT: 15000, // 15 seconds for challenge handling
+  COOKIE_REFRESH_TIMEOUT: 2 * 60 * 1000, // 2 minutes timeout for cookie refresh
+  MAX_REFRESH_RETRIES: 3, // Maximum retries for cookie refresh with new proxy/event
+};
+
+let browser = null;
+
+/**
+ * Gets a random location for browser fingerprinting
+ */
+function getRandomLocation() {
+  const locations = [
+    { locale: 'en-US', timezone: 'America/Los_Angeles', latitude: 34.052235, longitude: -118.243683 },
+    { locale: 'en-US', timezone: 'America/New_York', latitude: 40.712776, longitude: -74.005974 },
+    { locale: 'en-US', timezone: 'America/Chicago', latitude: 41.878113, longitude: -87.629799 },
+    { locale: 'en-US', timezone: 'America/Denver', latitude: 39.739235, longitude: -104.990250 },
+    { locale: 'en-CA', timezone: 'America/Toronto', latitude: 43.651070, longitude: -79.347015 },
+    { locale: 'en-GB', timezone: 'Europe/London', latitude: 51.507351, longitude: -0.127758 },
+  ];
+  
+  return locations[Math.floor(Math.random() * locations.length)];
+}
+
+/**
+ * Generate a realistic iPhone user agent
+ */
+function getRealisticIphoneUserAgent() {
+  // Updated to current iOS versions as of early 2026
+  const iOSVersions = ['18_0', '18_1', '18_2', '18_3', '19_0', '19_1', '19_2'];
+  const version = iOSVersions[Math.floor(Math.random() * iOSVersions.length)];
+  return `Mozilla/5.0 (iPhone; CPU iPhone OS ${version} like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/${version.split('_')[0]}.0 Mobile/15E148 Safari/604.1`;
+}
+
+/**
+ * Enhance fingerprint with more browser properties
+ */
+function enhancedFingerprint() {
+  const baseFingerprint = BrowserFingerprint.generate();
+  
+  // Add additional properties to make fingerprint more realistic
+  return {
+    ...baseFingerprint,
+    webgl: {
+      vendor: "Apple Inc.",
+      renderer: "Apple GPU",
+    },
+    fonts: [
+      "Arial",
+      "Courier New",
+      "Georgia",
+      "Times New Roman",
+      "Trebuchet MS",
+      "Verdana"
+    ],
+    plugins: [
+      "PDF Viewer",
+      "Chrome PDF Viewer",
+      "Chromium PDF Viewer",
+      "Microsoft Edge PDF Viewer",
+      "WebKit built-in PDF"
+    ],
+    screen: {
+      width: 390,
+      height: 844,
+      availWidth: 390,
+      availHeight: 844,
+      colorDepth: 24,
+      pixelDepth: 24
+    },
+    timezone: {
+      offset: new Date().getTimezoneOffset()
+    }
+  };
+}
+
+/**
+ * Simulate various mobile interactions to appear more human-like
+ */
+async function simulateMobileInteractions(page) {
+  try {
+    // Get viewport size
+    const viewportSize = page.viewportSize();
+    if (!viewportSize) return;
+    
+    // Random scroll amounts
+    const scrollOptions = [
+      { direction: 'down', amount: 300 },
+      { direction: 'down', amount: 500 },
+      { direction: 'down', amount: 800 },
+      { direction: 'up', amount: 200 },
+      { direction: 'up', amount: 400 }
+    ];
+    
+    // Pick 2-3 random scroll actions
+    const scrollCount = 2 + Math.floor(Math.random() * 2);
+    for (let i = 0; i < scrollCount; i++) {
+      const option = scrollOptions[Math.floor(Math.random() * scrollOptions.length)];
+      
+      // Scroll with a dynamic speed
+      const scrollY = option.direction === 'down' ? option.amount : -option.amount;
+      await page.evaluate((y) => {
+        window.scrollBy({
+          top: y,
+          behavior: 'smooth'
+        });
+      }, scrollY);
+      
+      // Random pause between scrolls (500-2000ms)
+      await page.waitForTimeout(500 + Math.floor(Math.random() * 1500));
+    }
+    
+    // Simulate random taps/clicks (1-2 times)
+    const tapCount = 1 + Math.floor(Math.random() * 2);
+    for (let i = 0; i < tapCount; i++) {
+      // Random position within viewport
+      const x = 50 + Math.floor(Math.random() * (viewportSize.width - 100));
+      const y = 150 + Math.floor(Math.random() * (viewportSize.height - 300));
+      
+      await page.mouse.click(x, y);
+      await page.waitForTimeout(500 + Math.floor(Math.random() * 1000));
+    }
+  } catch (error) {
+    console.warn("Error during mobile interaction simulation:", error.message);
+  }
+}
+
+/**
+ * Initialize the browser with enhanced fingerprinting
+ */
+
+async function initBrowser(proxy) {
+  let context = null;
+  
+  try {
+    // Get randomized human-like properties
+    const location = getRandomLocation();
+    
+    // For persisting browser sessions, use same browser if possible
+    if (!browser || !browser.isConnected()) {
+      // Launch options with enhanced stealth
+      const launchOptions = {
+        headless: true,
+        args: [
+          '--disable-blink-features=AutomationControlled',
+          '--disable-features=IsolateOrigins,site-per-process',
+          '--disable-web-security',
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--no-first-run',
+          '--no-default-browser-check',
+          '--disable-infobars',
+          '--disable-notifications',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding',
+          '--disable-features=TranslateUI',
+          '--disable-ipc-flooding-protection',
+          '--enable-features=NetworkService,NetworkServiceInProcess',
+          '--force-color-profile=srgb',
+          '--metrics-recording-only',
+          '--mute-audio',
+          '--disable-hang-monitor',
+          '--disable-prompt-on-repost',
+          '--disable-sync',
+          '--password-store=basic',
+          '--use-mock-keychain'
+        ],
+        timeout: 90000,
+      };
+
+      if (proxy && typeof proxy === 'object' && proxy.proxy) {
+        try {
+          // Extract hostname and port from proxy string
+          const proxyString = proxy.proxy;
+          
+          // Ensure proxyString is a string before using string methods
+          if (typeof proxyString !== 'string') {
+            throw new Error('Invalid proxy format: proxy.proxy must be a string, got ' + typeof proxyString);
+          }
+          
+          // Check if proxy string is in correct format (host:port)
+          if (!proxyString.includes(':')) {
+            throw new Error('Invalid proxy format: ' + proxyString);
+          }
+          
+          const [hostname, portStr] = proxyString.split(':');
+          const port = parseInt(portStr) || 80;
+          
+          launchOptions.proxy = {
+            server: `http://${hostname}:${port}`,
+            username: proxy.username,
+            password: proxy.password,
+          };
+          
+          console.log(`Configuring browser with proxy: ${hostname}:${port}`);
+        } catch (error) {
+          throw new Error(`Invalid proxy configuration, cannot refresh cookies without proxy: ${error.message}`);
+        }
+      } else {
+        throw new Error('Cannot refresh cookies without a valid proxy');
+      }
+
+      // Launch browser
+            browser = await chromium.launch(launchOptions);
+    }
+    
+    // Create new context with enhanced fingerprinting and stealth
+    context = await browser.newContext({
+      ...iphone13,
+      userAgent: getRealisticIphoneUserAgent(),
+      locale: location.locale,
+      colorScheme: ["dark", "light"][Math.floor(Math.random() * 2)],
+      timezoneId: location.timezone,
+      geolocation: {
+        latitude: location.latitude,
+        longitude: location.longitude,
+        accuracy: 100 * Math.random() + 50,
+      },
+      permissions: [
+        "geolocation",
+        "notifications",
+        "microphone",
+        "camera",
+      ],
+      deviceScaleFactor: 2 + Math.random() * 0.5,
+      hasTouch: true,
+      isMobile: true,
+      javaScriptEnabled: true,
+      acceptDownloads: true,
+      ignoreHTTPSErrors: true,
+      bypassCSP: true,
+      extraHTTPHeaders: {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
+        "Accept-Language": `${location.locale},en;q=0.9`,
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "DNT": Math.random() > 0.5 ? "1" : "0",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0"
+      },
+      viewport: {
+        width: [375, 390, 414][Math.floor(Math.random() * 3)],
+        height: [667, 736, 812, 844][Math.floor(Math.random() * 4)]
+      }
+    });
+    
+    // Add stealth scripts to mask automation (Patchright compatible)
+    await context.addInitScript(() => {
+      // Override navigator.webdriver
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined
+      });
+      
+      // Remove automation indicators
+      try {
+        delete navigator.__proto__.webdriver;
+      } catch (e) {}
+      
+      // Override plugins to look real
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => [1, 2, 3, 4, 5]
+      });
+      
+      // Override languages
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en']
+      });
+      
+      // Mock chrome object
+      window.chrome = {
+        runtime: {},
+        loadTimes: function() {},
+        csi: function() {},
+        app: {}
+      };
+      
+      // Override permissions
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
+      
+      // Add realistic connection info
+      Object.defineProperty(navigator, 'connection', {
+        get: () => ({
+          effectiveType: '4g',
+          rtt: 50,
+          downlink: 10,
+          saveData: false
+        })
+      });
+      
+      // Mock battery API
+      Object.defineProperty(navigator, 'getBattery', {
+        get: () => async () => ({
+          charging: Math.random() > 0.5,
+          chargingTime: 0,
+          dischargingTime: Infinity,
+          level: 0.5 + Math.random() * 0.5
+        })
+      });
+      
+      // Mock touch events for mobile
+      window.ontouchstart = null;
+      document.ontouchstart = null;
+      
+      // Add realistic screen properties
+      Object.defineProperty(screen, 'availWidth', { get: () => window.innerWidth });
+      Object.defineProperty(screen, 'availHeight', { get: () => window.innerHeight });
+    });
+    
+    // Create a new page and simulate human behavior
+    const page = await context.newPage();
+    
+    // Set realistic page load timeout
+    page.setDefaultTimeout(CONFIG.PAGE_TIMEOUT);
+    page.setDefaultNavigationTimeout(CONFIG.PAGE_TIMEOUT);
+    
+    // Human-like delay before any action
+    await page.waitForTimeout(1500 + Math.random() * 2500);
+    await simulateMobileInteractions(page);
+    
+    return { context, fingerprint: enhancedFingerprint(), page, browser };
+  } catch (error) {
+    console.error("Error initializing browser:", error.message);
+    
+    // Cleanup on error
+    if (context) await context.close().catch(() => {});
+    
+    throw error;
+  }
+} // Added missing closing bracket for initBrowser function
+
+/**
+ * Handle Ticketmaster challenge pages (CAPTCHA, etc.)
+ */
+async function handleTicketmasterChallenge(page) {
+  try {
+    const challengePresent = await page.evaluate(() => {
+      const bodyText = document.body.textContent || '';
+      const titleText = document.title || '';
+      
+      // Check for various challenge indicators
+      return bodyText.includes("Your Browsing Activity Has Been Paused") ||
+             bodyText.includes("Access Denied") ||
+             bodyText.includes("Security Check") ||
+             bodyText.includes("Please verify you are a human") ||
+             titleText.includes("Access Denied") ||
+             titleText.includes("Just a moment") ||
+             document.querySelector('#px-captcha') !== null ||
+             document.querySelector('.g-recaptcha') !== null;
+    }).catch(() => false);
+
+    if (challengePresent) {
+      console.log(" CHALLENGE DETECTED: Bot detection triggered - aborting this session");
+      console.log(" This proxy/session is compromised. Will request new proxy for retry.");
+      
+      // Throw error to trigger proxy rotation
+      throw new Error("CHALLENGE_DETECTED_ABORT_SESSION");
+    }
+    
+    return true;
+  } catch (error) {
+    if (error.message === "CHALLENGE_DETECTED_ABORT_SESSION") {
+      throw error; // Re-throw to propagate up
+    }
+    console.warn("Challenge check failed:", error.message);
+    return false;
+  }
+}
+
+/**
+ * Check for Ticketmaster challenge page
+ */
+async function checkForTicketmasterChallenge(page) {
+  try {
+    // Check for CAPTCHA or other blocking mechanisms
+    const challengeSelector = "#challenge-running"; // Example selector for CAPTCHA
+    const isChallengePresent = (await page.$(challengeSelector)) !== null;
+
+    if (isChallengePresent) {
+      console.warn("Ticketmaster challenge detected");
+      return true;
+    }
+
+    // Also check via text content
+    const challengePresent = await page.evaluate(() => {
+      return document.body.textContent.includes(
+        "Your Browsing Activity Has Been Paused"
+      );
+    }).catch(() => false);
+
+    return challengePresent;
+  } catch (error) {
+    console.error("Error checking for Ticketmaster challenge:", error);
+    return false;
+  }
+}
+
+/**
+ * Capture cookies from the browser
+ */
+async function captureCookies(page, fingerprint) {
+  let retryCount = 0;
+  const MAX_RETRIES = 5;
+  
+  while (retryCount < MAX_RETRIES) {
+    try {
+      const challengePresent = await page.evaluate(() => {
+        return document.body.textContent.includes(
+          "Your Browsing Activity Has Been Paused"
+        );
+      }).catch(() => false);
+
+      if (challengePresent) {
+        console.log(
+          `Attempt ${retryCount + 1}: Challenge detected during cookie capture`
+        );
+
+        const challengeResolved = await handleTicketmasterChallenge(page);
+        if (!challengeResolved) {
+          if (retryCount === MAX_RETRIES - 1) {
+            console.log("Max retries reached during challenge resolution");
+            return { cookies: null, fingerprint };
+          }
+          await page.waitForTimeout(CONFIG.RETRY_DELAY);
+          retryCount++;
+          continue;
+        }
+      }
+
+      // Get context from page's browser context
+      const context = page.context();
+      if (!context) {
+        throw new Error("Cannot access browser context from page");
+      }
+
+      let cookies = await context.cookies().catch(() => []);
+
+      if (!cookies?.length) {
+        console.log(`Attempt ${retryCount + 1}: No cookies captured`);
+        if (retryCount === MAX_RETRIES - 1) {
+          return { cookies: null, fingerprint };
+        }
+        await page.waitForTimeout(CONFIG.RETRY_DELAY);
+        retryCount++;
+        continue;
+      }
+
+      // Filter out reCAPTCHA Google cookies
+      cookies = cookies.filter(cookie => !cookie.name.includes('_grecaptcha') && 
+                                      !cookie.domain.includes('google.com'));
+
+      // Check if we have enough cookies from ticketmaster.com
+      const ticketmasterCookies = cookies.filter(cookie => 
+        cookie.domain.includes('ticketmaster.com') || 
+        cookie.domain.includes('.ticketmaster.com')
+      );
+
+      if (ticketmasterCookies.length < 3) {
+        console.log(`Attempt ${retryCount + 1}: Not enough Ticketmaster cookies`);
+        if (retryCount === MAX_RETRIES - 1) {
+          return { cookies: null, fingerprint };
+        }
+        await page.waitForTimeout(CONFIG.RETRY_DELAY);
+        retryCount++;
+        continue;
+      }
+
+      // Check JSON size
+      const cookiesJson = JSON.stringify(cookies, null, 2);
+      const lineCount = cookiesJson.split('\n').length;
+      
+      if (lineCount < 200) {
+        console.log(`Attempt ${retryCount + 1}: Cookie JSON too small (${lineCount} lines)`);
+        if (retryCount === MAX_RETRIES - 1) {
+          return { cookies: null, fingerprint };
+        }
+        await page.waitForTimeout(CONFIG.RETRY_DELAY);
+        retryCount++;
+        continue;
+      }
+
+      const oneHourFromNow = Date.now() + CONFIG.COOKIE_REFRESH_INTERVAL;
+      cookies = cookies.map((cookie) => ({
+        ...cookie,
+        expires: oneHourFromNow / 1000,
+        expiry: oneHourFromNow / 1000,
+      }));
+
+      // Add cookies one at a time with error handling
+      for (const cookie of cookies) {
+        try {
+          await context.addCookies([cookie]);
+        } catch (error) {
+          console.warn(`Error adding cookie ${cookie.name}:`, error.message);
+        }
+      }
+
+      // Save cookies to file
+      await saveCookiesToFile(cookies);
+      console.log(`Successfully captured cookies on attempt ${retryCount + 1}`);
+      return { cookies, fingerprint };
+    } catch (error) {
+      console.error(`Error capturing cookies on attempt ${retryCount + 1}:`, error);
+      if (retryCount === MAX_RETRIES - 1) {
+        return { cookies: null, fingerprint };
+      }
+      await page.waitForTimeout(CONFIG.RETRY_DELAY);
+      retryCount++;
+    }
+  }
+
+  return { cookies: null, fingerprint };
+}
+
+/**
+ * Save cookies to a file
+ */
+async function saveCookiesToFile(cookies) {
+  try {
+    // Format the cookies with updated expiration
+    const cookieData = cookies.map(cookie => ({
+      ...cookie,
+      expires: cookie.expires || Date.now() + CONFIG.COOKIE_REFRESH_INTERVAL,
+      expiry: cookie.expiry || Date.now() + CONFIG.COOKIE_REFRESH_INTERVAL
+    }));
+
+    await fs.writeFile(COOKIES_FILE, JSON.stringify(cookieData, null, 2));
+    console.log(`Saved ${cookies.length} cookies to ${COOKIES_FILE}`);
+    return true;
+  } catch (error) {
+    console.error(`Error saving cookies to file: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * Load cookies from file
+ */
+async function loadCookiesFromFile() {
+  try {
+    const cookiesFile = path.join(process.cwd(), COOKIES_FILE);
+    
+    // Check if file exists
+    try {
+      await fs.access(cookiesFile);
+    } catch (error) {
+      console.log("Cookies file does not exist");
+      return null;
+    }
+    
+    // Read and parse
+    const fileData = await fs.readFile(cookiesFile, 'utf8');
+    const cookies = JSON.parse(fileData);
+    
+    if (!Array.isArray(cookies) || cookies.length === 0) {
+      console.log("Invalid or empty cookies file");
+      return null;
+    }
+    
+    console.log(`Loaded ${cookies.length} cookies from file`);
+    return cookies;
+  } catch (error) {
+    console.error(`Error loading cookies from file: ${error.message}`);
+    return null;
+  }
+}
+
+/**
+ * Get fresh cookies by opening a browser and navigating to Ticketmaster
+ */
+async function refreshCookies(eventId, proxy = null) {
+  if (!proxy || !proxy.proxy) {
+    throw new Error('Cannot refresh cookies without a valid proxy');
+  }
+  let retryCount = 0;
+  let lastError = null;
+  
+  while (retryCount <= CONFIG.MAX_REFRESH_RETRIES) {
+    let localContext = null;
+    let page = null;
+    let browserInstance = null;
+    let timeoutId = null;
+    
+    try {
+      console.log(`Refreshing cookies using event ${eventId} (attempt ${retryCount + 1}/${CONFIG.MAX_REFRESH_RETRIES + 1})`);
+
+      // Try to load existing cookies first (only on first attempt)
+      if (retryCount === 0) {
+        const existingCookies = await loadCookiesFromFile();
+        if (existingCookies && existingCookies.length >= 3) {
+          const cookieAge = existingCookies[0]?.expiry ? 
+            (existingCookies[0].expiry * 1000 - Date.now()) : 0;
+          
+          if (cookieAge > 0 && cookieAge < CONFIG.COOKIE_REFRESH_INTERVAL) {
+            console.log(`Using existing cookies (age: ${Math.floor(cookieAge/1000/60)} minutes)`);
+            return {
+              cookies: existingCookies,
+              fingerprint: BrowserFingerprint.generate(),
+              lastRefresh: Date.now()
+            };
+          }
+        }
+      }
+      
+      // Create a promise that will be resolved/rejected based on timeout
+      const refreshPromise = new Promise(async (resolve, reject) => {
+        // Set up timeout
+        timeoutId = setTimeout(() => {
+          reject(new Error(`Cookie refresh timeout after ${CONFIG.COOKIE_REFRESH_TIMEOUT / 1000} seconds`));
+        }, CONFIG.COOKIE_REFRESH_TIMEOUT);
+        
+        try {
+
+          // Initialize browser with improved error handling
+          let initAttempts = 0;
+          let initSuccess = false;
+          let initError = null;
+          
+          while (initAttempts < 3 && !initSuccess) {
+            try {
+              const result = await initBrowser(proxy);
+              if (!result || !result.context || !result.fingerprint) {
+                throw new Error("Failed to initialize browser or generate fingerprint");
+              }
+              
+              browserInstance = result.browser;
+              localContext = result.context;
+              page = result.page;
+              
+              initSuccess = true;
+            } catch (error) {
+              initAttempts++;
+              initError = error;
+              console.error(`Browser init attempt ${initAttempts} failed:`, error.message);
+              await new Promise(resolve => setTimeout(resolve, 1000 * initAttempts));
+            }
+          }
+          
+          if (!initSuccess) {
+            console.error("All browser initialization attempts failed");
+            throw initError || new Error("Failed to initialize browser");
+          }
+
+          // Navigate to event page
+          const url = `https://www.ticketmaster.com/event/${eventId}`;
+          console.log(`Navigating to ${url}`);
+          
+          await page.goto(url, {
+            waitUntil: "domcontentloaded",
+            timeout: CONFIG.PAGE_TIMEOUT
+          });
+          
+          // Check if the page loaded properly
+          const currentUrl = page.url();
+          const pageLoadSuccessful = currentUrl.includes(`/event/${eventId}`);
+          
+          if (!pageLoadSuccessful) {
+            console.warn(`Failed to load event page, URL: ${currentUrl}`);
+            
+            // Try refreshing the page
+            console.log("Attempting to reload the page...");
+            await page.reload({ waitUntil: "domcontentloaded", timeout: CONFIG.PAGE_TIMEOUT });
+            
+            const newUrl = page.url();
+            const reloadSuccessful = newUrl.includes(`/event/${eventId}`);
+            
+            if (!reloadSuccessful) {
+              console.warn(`Reload failed, URL: ${newUrl}`);
+              throw new Error("Failed to load Ticketmaster event page");
+            }
+          }
+          
+          console.log(`Successfully loaded page for event ${eventId}`);
+          
+          // Check for Ticketmaster challenge
+          const isChallengePresent = await checkForTicketmasterChallenge(page);
+          if (isChallengePresent) {
+            console.warn("Detected Ticketmaster challenge page, attempting to resolve...");
+            await handleTicketmasterChallenge(page);
+          }
+          
+          // Simulate human behavior
+          await simulateMobileInteractions(page);
+          
+          // Wait for cookies to be set
+          await page.waitForTimeout(2000);
+          
+          // Capture cookies
+          const fingerprint = BrowserFingerprint.generate();
+          const { cookies } = await captureCookies(page, fingerprint);
+          
+          if (!cookies || cookies.length === 0) {
+            throw new Error("Failed to capture cookies");
+          }
+          
+          // Clear timeout and resolve with success
+          clearTimeout(timeoutId);
+          resolve({
+            cookies,
+            fingerprint,
+            lastRefresh: Date.now()
+          });
+        } catch (error) {
+          clearTimeout(timeoutId);
+          reject(error);
+        }
+      });
+      
+      // Wait for the refresh promise to complete
+      const result = await refreshPromise;
+      return result;
+    } catch (error) {
+      lastError = error;
+      console.error(`Cookie refresh attempt ${retryCount + 1} failed: ${error.message}`);
+      
+      // Check if this was a timeout error
+      const isTimeout = error.message.includes('timeout');
+      
+      if (isTimeout && retryCount < CONFIG.MAX_REFRESH_RETRIES) {
+        console.log(`Cookie refresh timed out, will retry with new proxy and event ID`);
+        
+        // Generate a new event ID for retry (use a different event from the same venue/artist)
+        const newEventId = await generateAlternativeEventId(eventId);
+        if (newEventId && newEventId !== eventId) {
+          console.log(`Using alternative event ID for retry: ${newEventId}`);
+          eventId = newEventId;
+        }
+        
+        // Get a new proxy for retry
+        if (proxy) {
+          const newProxy = await getAlternativeProxy(proxy);
+          if (newProxy) {
+            console.log(`Using alternative proxy for retry: ${newProxy.host}:${newProxy.port}`);
+            proxy = newProxy;
+          }
+        }
+      }
+      
+      retryCount++;
+      
+      // If we've exhausted all retries, throw the last error
+      if (retryCount > CONFIG.MAX_REFRESH_RETRIES) {
+        console.error(`All cookie refresh attempts failed after ${CONFIG.MAX_REFRESH_RETRIES + 1} tries`);
+        throw lastError;
+      }
+      
+      // Wait before retrying
+      await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY * retryCount));
+      
+    } finally {
+      // Close page and context but keep browser open for reuse
+      if (page) {
+        try {
+          await page.close().catch(e => console.error("Error closing page:", e));
+        } catch (e) {
+          console.error("Error closing page in finally block:", e);
+        }
+      }
+      
+      if (localContext) {
+        try {
+          await localContext.close().catch(e => console.error("Error closing context:", e));
+        } catch (e) {
+          console.error("Error closing context in finally block:", e);
+        }
+      }
+    }
+  }
+  
+  // This should never be reached, but just in case
+  throw lastError || new Error('Cookie refresh failed after all retries');
+}
+
+/**
+ * Generate an alternative event ID for retry attempts
+ * This function attempts to find a similar event or generates a fallback
+ */
+async function generateAlternativeEventId(originalEventId) {
+  try {
+    // For now, we'll generate a simple variation of the original event ID
+    // In a production environment, this could query a database for similar events
+    const timestamp = Date.now().toString().slice(-6);
+    const randomSuffix = Math.random().toString(36).substring(2, 8);
+    
+    // Create a variation that's likely to be a valid event ID format
+    const alternativeId = originalEventId.replace(/\d+$/, timestamp + randomSuffix);
+    
+    console.log(`Generated alternative event ID: ${alternativeId} from original: ${originalEventId}`);
+    return alternativeId;
+  } catch (error) {
+    console.warn(`Failed to generate alternative event ID: ${error.message}`);
+    return originalEventId; // Fallback to original
+  }
+}
+
+/**
+ * Get an alternative proxy for retry attempts
+ * This function should integrate with your proxy management system
+ */
+
+/**
+ * Initialize persistent browser context for API requests
+ * This bypasses TLS fingerprinting by using real browser requests
+ */
+async function initApiBrowserContext(proxy = null, cookies = null) {
+  // If context already exists and is valid, return it
+  if (apiContext && apiBrowser && apiBrowser.isConnected()) {
+    // Verify the page is still alive by checking if it's not closed
+    try {
+      if (apiPage && !apiPage.isClosed()) {
+        // Update cookies if provided
+        if (cookies && cookies.length > 0) {
+          try {
+            await apiContext.clearCookies();
+            const browserCookies = cookies.map(c => ({
+              name: c.name,
+              value: c.value,
+              domain: c.domain || '.ticketmaster.com',
+              path: c.path || '/',
+              expires: c.expires || c.expiry || -1,
+              httpOnly: c.httpOnly || false,
+              secure: c.secure || true,
+              sameSite: c.sameSite || 'Lax'
+            }));
+            await apiContext.addCookies(browserCookies);
+          } catch (e) {
+            console.warn('Error updating API context cookies:', e.message);
+          }
+        }
+        return { browser: apiBrowser, context: apiContext, page: apiPage };
+      }
+    } catch (e) {
+      // Context is broken, fall through to recreate
+      console.warn('Cached API context is broken, recreating:', e.message);
+    }
+    // Clean up the dead context
+    await cleanupApiBrowser();
+  }
+
+  // Wait if context is being created
+  if (apiContextLock) {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    if (apiContext && apiBrowser && apiBrowser.isConnected()) {
+      return { browser: apiBrowser, context: apiContext, page: apiPage };
+    }
+  }
+
+  apiContextLock = true;
+
+  try {
+    const location = getRandomLocation();
+    const fingerprint = BrowserFingerprint.generate('desktop');
+    
+    const launchOptions = {
+      headless: true,
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
+        '--window-size=1920,1080',
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins',
+        '--disable-site-isolation-trials',
+        // Memory optimizations for 30 PM2 instances on 160GB
+        '--js-flags=--max-old-space-size=256',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--disable-translate',
+        '--metrics-recording-only',
+        '--no-first-run',
+        '--disable-hang-monitor',
+        '--disable-popup-blocking',
+        '--disable-prompt-on-repost',
+        '--disable-renderer-backgrounding',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-ipc-flooding-protection',
+      ],
+    };
+
+    // Configure proxy if provided
+    if (proxy) {
+      try {
+        let proxyString = proxy.proxy || proxy;
+        if (typeof proxyString !== 'string') {
+          throw new Error('Invalid proxy format');
+        }
+        
+        const [hostname, portStr] = proxyString.split(':');
+        const port = parseInt(portStr) || 80;
+        
+        launchOptions.proxy = {
+          server: `http://${hostname}:${port}`,
+          username: proxy.username,
+          password: proxy.password,
+        };
+      } catch (error) {
+        console.warn('Invalid proxy for API context:', error.message);
+      }
+    }
+
+    // Launch browser for API requests
+    apiBrowser = await chromium.launch(launchOptions);
+    
+    // Create desktop context (better for API requests)
+    apiContext = await apiBrowser.newContext({
+      userAgent: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36`,
+      locale: location.locale,
+      timezoneId: location.timezone,
+      viewport: { width: 1920, height: 1080 },
+      deviceScaleFactor: 1,
+      hasTouch: false,
+      isMobile: false,
+      javaScriptEnabled: true,
+      ignoreHTTPSErrors: true,
+      bypassCSP: true,
+      extraHTTPHeaders: {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+      }
+    });
+
+    // Add stealth scripts to mask automation indicators
+    await apiContext.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      try { delete navigator.__proto__.webdriver; } catch (e) {}
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+      const origQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (p) => (
+        p.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : origQuery(p)
+      );
+      Object.defineProperty(navigator, 'connection', {
+        get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false })
+      });
+    });
+
+    // Add cookies if provided
+    if (cookies && cookies.length > 0) {
+      const browserCookies = cookies.map(c => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain || '.ticketmaster.com',
+        path: c.path || '/',
+        expires: c.expires || c.expiry || -1,
+        httpOnly: c.httpOnly || false,
+        secure: c.secure || true,
+        sameSite: c.sameSite || 'Lax'
+      }));
+      await apiContext.addCookies(browserCookies);
+    }
+
+    // Create a page for requests
+    apiPage = await apiContext.newPage();
+    
+    // Navigate to ticketmaster initially to establish session
+    try {
+      await apiPage.goto('https://www.ticketmaster.com/', { 
+        waitUntil: 'domcontentloaded',
+        timeout: 30000 
+      });
+      await new Promise(r => setTimeout(r, 1000));
+    } catch (e) {
+      // If browser crashed (Target closed), this is fatal — don't return dead context
+      if (e.message?.includes('Target') && e.message?.includes('closed')) {
+        console.error('Browser crashed during initial navigation:', e.message);
+        await cleanupApiBrowser();
+        throw new Error(`Browser crashed during init: ${e.message}`);
+      }
+      console.warn('Initial TM navigation warning:', e.message);
+    }
+
+    // Verify browser is still alive before returning
+    if (!apiBrowser.isConnected()) {
+      console.error('Browser disconnected after init');
+      await cleanupApiBrowser();
+      throw new Error('Browser disconnected immediately after launch');
+    }
+
+    console.log('API browser context initialized successfully');
+    return { browser: apiBrowser, context: apiContext, page: apiPage };
+    
+  } catch (error) {
+    console.error('Failed to initialize API browser context:', error.message);
+    await cleanupApiBrowser();
+    throw error;
+  } finally {
+    apiContextLock = false;
+  }
+}
+
+/**
+ * Make an API request through the browser context (bypasses TLS fingerprinting)
+ * @param {string} url - The URL to fetch
+ * @param {object} headers - Request headers
+ * @param {object} proxy - Proxy configuration
+ * @param {array} cookies - Cookies to use
+ * @returns {Promise<object>} Response data
+ */
+async function browserApiRequest(url, headers = {}, proxy = null, cookies = null) {
+  try {
+    // Initialize or get existing API context
+    const { page, context } = await initApiBrowserContext(proxy, cookies);
+    
+    if (!page || !context) {
+      throw new Error('Failed to get API browser context');
+    }
+
+    // Make request using page.evaluate with fetch (uses browser's TLS stack)
+    const result = await page.evaluate(async ({ url, headers }) => {
+      try {
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: headers,
+          credentials: 'include',
+          mode: 'cors',
+        });
+        
+        const status = response.status;
+        const statusText = response.statusText;
+        
+        if (!response.ok) {
+          return { 
+            success: false, 
+            status, 
+            statusText,
+            error: `HTTP ${status}: ${statusText}` 
+          };
+        }
+        
+        const data = await response.json();
+        return { success: true, data, status };
+        
+      } catch (error) {
+        return { 
+          success: false, 
+          error: error.message,
+          status: 0 
+        };
+      }
+    }, { url, headers });
+
+    if (!result.success) {
+      const error = new Error(result.error || `Request failed with status ${result.status}`);
+      error.statusCode = result.status;
+      throw error;
+    }
+
+    return result.data;
+    
+  } catch (error) {
+    // If browser context fails, try to reinitialize
+    if (error.message?.includes('Target closed') || error.message?.includes('Browser')) {
+      await cleanupApiBrowser();
+    }
+    throw error;
+  }
+}
+
+/**
+ * Clean up API browser resources
+ */
+async function cleanupApiBrowser() {
+  try {
+    if (apiPage) {
+      await apiPage.close().catch(() => {});
+      apiPage = null;
+    }
+    if (apiContext) {
+      await apiContext.close().catch(() => {});
+      apiContext = null;
+    }
+    if (apiBrowser) {
+      await apiBrowser.close().catch(() => {});
+      apiBrowser = null;
+    }
+  } catch (error) {
+    console.warn('Error cleaning up API browser:', error.message);
+  }
+}
+
+/**
+ * Check if API browser context is available
+ */
+function isApiBrowserAvailable() {
+  return apiBrowser && apiBrowser.isConnected() && apiContext && apiPage;
+}
+
+// ====================================================
+// RequestBatcher: Groups requests from MANY events into mega-batches.
+// Instead of 1 page per event (2 fetches), 1 page handles 20 events
+// (40 fetches) in a single page.evaluate(Promise.all(...)) call.
+// 8 pages × 20 events = 160 events per cycle ≈ 40-50 events/sec.
+// ====================================================
+class RequestBatcher {
+  constructor(pool, maxEventsPerBatch = 10, flushIntervalMs = 50) {
+    this.pool = pool;
+    this.maxEventsPerBatch = maxEventsPerBatch;
+    this.flushIntervalMs = flushIntervalMs;
+    this.queue = []; // [{requests: [{url,headers}], resolve, reject}]
+    this._timer = null;
+    this._activeFlushes = 0;
+  }
+
+  /**
+   * Submit requests for one event. Returns Promise<results[]>.
+   * Requests are automatically batched with other events for throughput.
+   */
+  submit(requests) {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ requests, resolve, reject });
+      this._scheduleFlush();
+    });
+  }
+
+  _scheduleFlush() {
+    // Immediate flush when batch is full
+    if (this.queue.length >= this.maxEventsPerBatch) {
+      this._tryFlush();
+    }
+    // Always ensure a timer is running while items are queued
+    if (this.queue.length > 0 && !this._timer) {
+      this._timer = setTimeout(() => {
+        this._timer = null;
+        this._tryFlush();
+      }, this.flushIntervalMs);
+    }
+  }
+
+  _tryFlush() {
+    if (this.queue.length === 0) return;
+
+    // Limit parallel flushes to number of pool pages
+    if (this._activeFlushes >= this.pool.pages.length) {
+      // All pages busy — schedule retry
+      if (!this._timer) {
+        this._timer = setTimeout(() => {
+          this._timer = null;
+          this._tryFlush();
+        }, 50);
+      }
+      return;
+    }
+
+    const batch = this.queue.splice(0, this.maxEventsPerBatch);
+    if (batch.length === 0) return;
+
+    this._activeFlushes++;
+    this._executeBatch(batch).finally(() => {
+      this._activeFlushes--;
+      // Flush more if queued
+      if (this.queue.length > 0) {
+        setImmediate(() => this._tryFlush());
+      }
+    });
+
+    // If still more in queue, try another flush (will use a different page)
+    if (this.queue.length > 0) {
+      setImmediate(() => this._tryFlush());
+    }
+  }
+
+  async _executeBatch(batch) {
+    // Build flat request array with index tracking
+    const allRequests = [];
+    const indexMap = []; // maps flat index → {batchIdx, reqIdx}
+
+    for (let i = 0; i < batch.length; i++) {
+      for (let j = 0; j < batch[i].requests.length; j++) {
+        indexMap.push({ bi: i, ri: j });
+        allRequests.push(batch[i].requests[j]);
+      }
+    }
+
+    let page;
+    try {
+      page = await this.pool.acquire(20000); // 20s timeout for page acquisition
+    } catch (err) {
+      for (const item of batch) item.reject(err);
+      return;
+    }
+
+    // Fail fast if page was closed between acquire and evaluate
+    if (page.isClosed()) {
+      this.pool._removePage(page);
+      for (const item of batch) item.reject(new Error('Acquired page was already closed'));
+      return;
+    }
+
+    try {
+      const results = await page.evaluate(async (reqs) => {
+        return Promise.all(reqs.map(async ({ url, headers }) => {
+          try {
+            const r = await fetch(url, {
+              method: 'GET',
+              headers,
+              credentials: 'include',
+              mode: 'cors'
+            });
+            if (!r.ok) return { success: false, status: r.status, error: `HTTP ${r.status}` };
+            const d = await r.json();
+            return { success: true, data: d, status: r.status };
+          } catch (e) {
+            return { success: false, error: e.message, status: 0 };
+          }
+        }));
+      }, allRequests);
+
+      this.pool.release(page);
+
+      // Track errors for cookie refresh triggering
+      for (const r of results) {
+        if (r.status) this.pool.trackError(r.status);
+      }
+
+      // Distribute results back to each event's promise
+      const eventResults = batch.map(() => []);
+      for (let i = 0; i < results.length; i++) {
+        eventResults[indexMap[i].bi][indexMap[i].ri] = results[i];
+      }
+      for (let i = 0; i < batch.length; i++) {
+        batch[i].resolve(eventResults[i]);
+      }
+
+      // Batch completion logged at debug level only
+    } catch (error) {
+      // Handle dead pages
+      if (error.message?.includes('Target closed') ||
+          error.message?.includes('Protocol error') ||
+          error.message?.includes('crashed') ||
+          error.message?.includes('Execution context')) {
+        this.pool._removePage(page);
+      } else {
+        this.pool.release(page);
+      }
+      // Reject all events in this batch
+      for (const item of batch) item.reject(error);
+    }
+  }
+
+  cleanup() {
+    if (this._timer) {
+      clearTimeout(this._timer);
+      this._timer = null;
+    }
+    // Reject everything still queued
+    for (const item of this.queue) {
+      item.reject(new Error('Batcher cleanup'));
+    }
+    this.queue = [];
+  }
+}
+
+// ====================================================
+// BrowserPagePool: Pool of browser pages for parallel API requests
+// All pages share one browser context (same cookies, proxy, real TLS).
+// The RequestBatcher multiplexes many events onto each page.
+// ====================================================
+class BrowserPagePool {
+  constructor(size = 3) {
+    this.size = size;
+    this.pages = [];
+    this.available = [];
+    this.waiting = [];
+    this.initialized = false;
+    this._initPromise = null;
+    this._context = null;
+    this._browser = null;
+    this._batcher = null;
+    // Cookie refresh via full browser restart
+    this._lastCookieRefresh = Date.now();
+    this._cookieRefreshInterval = 8 * 60 * 1000; // 8 minutes — well before 10-15m expiry
+    this._isRestarting = false;
+    this._refreshTimer = null;
+    this._consecutiveErrors = 0;
+    // Proxy rotation after N requests
+    this._requestsSinceRotation = 0;
+    this._proxyRotationThreshold = 500; // rotate proxy every 500 event calls — avoids restart thrashing
+    // Store init params for restart
+    this._initProxy = null;
+    this._initCookies = null;
+    this._initEventId = null;
+    // Deferred requests queue (filled during restart)
+    this._deferredQueue = [];
+  }
+
+  async init(proxy = null, cookies = null, eventId = null) {
+    // Already initialized and browser alive — nothing to do
+    if (this.initialized && this._browser?.isConnected()) return;
+
+    // Another caller is already initializing — piggyback on their promise
+    if (this._initPromise) return this._initPromise;
+
+    this._initPromise = this._doInit(proxy, cookies, eventId);
+    try {
+      await this._initPromise;
+    } catch (e) {
+      this._initPromise = null;
+      throw e;
+    }
+  }
+
+  async _doInit(proxy, cookies, eventId = null) {
+    // Only cleanup if there's something to clean up
+    if (this.pages.length > 0 || this._browser) {
+      await this.cleanup();
+    }
+
+    // Save init params for browser restart
+    this._initProxy = proxy;
+    this._initCookies = cookies;
+    this._initEventId = eventId;
+
+    console.log(`[PagePool] Initial proxy: ${proxy?.proxy || 'none'}`);
+
+    // initApiBrowserContext launches browser, creates context with stealth scripts,
+    // creates an apiPage, and navigates it to ticketmaster.com — this seeds initial
+    // cookies into the shared context.
+    const { browser, context } = await initApiBrowserContext(proxy, cookies);
+    this._browser = browser;
+    this._context = context;
+
+    // Auto-recover if browser process crashes unexpectedly
+    browser.on('disconnected', () => {
+      if (this._isRestarting) return; // Already handling it
+      console.error('[PagePool] Browser disconnected unexpectedly — scheduling auto-restart');
+      this.initialized = false;
+      this._initPromise = null;
+      this.pages = [];
+      this.available = [];
+      // Restart after a brief pause to avoid tight loops
+      setTimeout(() => {
+        if (!this._isRestarting && !this.initialized) {
+          this._restartBrowser('browser-crash').catch(err => {
+            console.error(`[PagePool] Auto-restart after crash failed: ${err.message}`);
+          });
+        }
+      }, 2000);
+    });
+
+    // Navigate one seed page to a real event page to get full cookies
+    const eventUrl = eventId
+      ? `https://www.ticketmaster.com/event/${eventId}`
+      : 'https://www.ticketmaster.com/';
+
+    console.log(`[PagePool] Seeding cookies via: ${eventUrl}`);
+    const seedPage = await context.newPage();
+    try {
+      await seedPage.goto(eventUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await new Promise(r => setTimeout(r, 2000));
+
+      const allCookies = await context.cookies();
+      const tmCookies = allCookies.filter(c => c.domain.includes('ticketmaster'));
+      console.log(`[PagePool] ${tmCookies.length} TM cookies seeded`);
+
+      if (tmCookies.length === 0) {
+        console.warn('[PagePool] WARNING: No TM cookies found after page load!');
+      }
+    } catch (e) {
+      console.error(`[PagePool] Seed page load failed: ${e.message}`);
+      await seedPage.close().catch(() => {});
+      throw e;
+    }
+
+    // The seed page becomes pool page #1
+    this.pages.push(seedPage);
+    this.available.push(seedPage);
+
+    // Create remaining pool pages (they share cookies via context)
+    for (let i = 1; i < this.size; i++) {
+      try {
+        const page = await context.newPage();
+        // Navigate to about:blank is fine — cookies are in the context, not the page
+        // But navigate to TM domain so fetch origin is correct
+        await page.goto('https://www.ticketmaster.com/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 30000
+        });
+        this.pages.push(page);
+        this.available.push(page);
+      } catch (e) {
+        console.warn(`[PagePool] Extra page ${i + 1} creation failed: ${e.message}`);
+      }
+    }
+
+    // Batcher: 20 events/batch × pages, flush every 100ms
+    this._batcher = new RequestBatcher(this, 20, 100);
+
+    this._lastCookieRefresh = Date.now();
+    this._consecutiveErrors = 0;
+    this._isRestarting = false;
+
+    // Start periodic browser restart timer
+    this._startRestartTimer();
+
+    this.initialized = true;
+    this._initPromise = null;
+    console.log(`[PagePool] Ready: ${this.pages.length} page(s) — restart every ${this._cookieRefreshInterval / 60000}min`);
+  }
+
+  /**
+   * Start a background timer that restarts the browser every 8 minutes
+   * to get completely fresh cookies and prevent stale session issues.
+   */
+  _startRestartTimer() {
+    if (this._refreshTimer) clearInterval(this._refreshTimer);
+
+    this._refreshTimer = setInterval(async () => {
+      if (this._isRestarting) return;
+      console.log(`[PagePool] Scheduled browser restart (cookies age: ${Math.round((Date.now() - this._lastCookieRefresh) / 60000)}min)`);
+      await this._restartBrowser('scheduled');
+    }, this._cookieRefreshInterval);
+  }
+
+  /**
+   * Full browser restart for cookie refresh.
+   * 1. Pause new requests (queue them in _deferredQueue)
+   * 2. Wait for in-flight batches to finish
+   * 3. Close browser + all pages
+   * 4. Relaunch with fresh cookies
+   * 5. Drain deferred queue
+   */
+  async _restartBrowser(reason = 'scheduled') {
+    if (this._isRestarting) return;
+    this._isRestarting = true;
+    const restartStart = Date.now();
+
+    console.log(`[PagePool] Browser restart starting (${reason})...`);
+
+    try {
+      // 1. Stop the old batcher — no new flushes; items already in-flight will finish
+      const oldBatcher = this._batcher;
+      this._batcher = null;
+      this.initialized = false; // submitRequests will queue to _deferredQueue
+
+      // 2. Wait for in-flight batch flushes to complete (max 10s)
+      if (oldBatcher) {
+        const waitStart = Date.now();
+        while (oldBatcher._activeFlushes > 0 && Date.now() - waitStart < 10000) {
+          await new Promise(r => setTimeout(r, 100));
+        }
+        // Reject anything still queued in old batcher
+        oldBatcher.cleanup();
+      }
+
+      // 3. Reject all waiting page acquirers
+      for (const w of this.waiting) {
+        clearTimeout(w.timer);
+        w.resolve = null; // prevent double-resolve
+      }
+      this.waiting = [];
+
+      // 4. Close all pages
+      await Promise.allSettled(this.pages.map(p => p.close().catch(() => {})));
+      this.pages = [];
+      this.available = [];
+
+      // 5. Close old browser
+      if (this._browser) {
+        try {
+          await this._browser.close();
+        } catch (e) {
+          // Browser may already be dead
+        }
+        this._browser = null;
+        this._context = null;
+      }
+
+      // Also clean up the global apiContext references
+      apiBrowser = null;
+      apiContext = null;
+      apiPage = null;
+
+      // 6. Pick a fresh random proxy for the new browser
+      const allProxies = proxyArray.proxies;
+      const newProxy = allProxies.length > 0
+        ? allProxies[Math.floor(Math.random() * allProxies.length)]
+        : this._initProxy;
+      this._initProxy = newProxy;
+      console.log(`[PagePool] Rotated proxy to ${newProxy?.proxy || 'none'}`);
+
+      // 7. Relaunch browser + context + pages
+      const { browser, context } = await initApiBrowserContext(newProxy, this._initCookies);
+      this._browser = browser;
+      this._context = context;
+
+      // Seed cookies with one page navigation
+      const seedPage = await context.newPage();
+      let seedUrl = 'https://www.ticketmaster.com/';
+      try {
+        const { Event } = await import('./models/index.js');
+        const randomEvents = await Event.aggregate([
+          { $match: { Skip_Scraping: { $ne: true } } },
+          { $sample: { size: 1 } },
+          { $project: { Event_ID: 1 } }
+        ]);
+        if (randomEvents?.length > 0) {
+          seedUrl = `https://www.ticketmaster.com/event/${randomEvents[0].Event_ID}`;
+        }
+      } catch (e) { /* fall back to homepage */ }
+
+      await seedPage.goto(seedUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await new Promise(r => setTimeout(r, 2000));
+
+      const tmCookies = (await context.cookies()).filter(c => c.domain.includes('ticketmaster'));
+      console.log(`[PagePool] Restart: ${tmCookies.length} TM cookies after seed`);
+
+      this.pages.push(seedPage);
+      this.available.push(seedPage);
+
+      // Create remaining pool pages
+      for (let i = 1; i < this.size; i++) {
+        try {
+          const page = await context.newPage();
+          await page.goto('https://www.ticketmaster.com/', {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
+          });
+          this.pages.push(page);
+          this.available.push(page);
+        } catch (e) {
+          console.warn(`[PagePool] Restart: extra page ${i + 1} failed: ${e.message}`);
+        }
+      }
+
+      // 7. Create new batcher and mark ready
+      this._batcher = new RequestBatcher(this, 20, 100);
+      this._lastCookieRefresh = Date.now();
+      this._consecutiveErrors = 0;
+      this._requestsSinceRotation = 0;
+      this.initialized = true;
+
+      const restartMs = Date.now() - restartStart;
+      console.log(`[PagePool] Browser restart complete in ${restartMs}ms — ${this.pages.length} page(s) ready`);
+
+      // 8. Drain deferred queue — resubmit requests that came in during restart
+      if (this._deferredQueue.length > 0) {
+        const deferred = this._deferredQueue.splice(0);
+        console.log(`[PagePool] Draining ${deferred.length} deferred request(s)`);
+        for (const { requests, resolve, reject, timer } of deferred) {
+          if (timer) clearTimeout(timer);
+          this._batcher.submit(requests).then(resolve).catch(reject);
+        }
+      }
+    } catch (error) {
+      console.error(`[PagePool] Browser restart FAILED: ${error.message}`);
+      // Mark as not initialized so next submitRequests triggers re-init
+      this.initialized = false;
+      this._initPromise = null;
+      // Reject all deferred
+      for (const { reject, timer } of this._deferredQueue) {
+        if (timer) clearTimeout(timer);
+        reject(new Error(`Browser restart failed: ${error.message}`));
+      }
+      this._deferredQueue = [];
+    } finally {
+      this._isRestarting = false;
+    }
+  }
+
+  /**
+   * Track errors from batch results. If too many 403s pile up,
+   * trigger an early browser restart.
+   */
+  trackError(status) {
+    if (status === 403) {
+      this._consecutiveErrors++;
+      if (this._consecutiveErrors >= 5 && !this._isRestarting) {
+        console.log(`[PagePool] ${this._consecutiveErrors} consecutive 403s — triggering browser restart`);
+        this._restartBrowser('403-errors').catch(() => {});
+      }
+    } else if (status >= 200 && status < 400) {
+      this._consecutiveErrors = 0;
+    }
+  }
+
+  /**
+   * Submit requests for ONE event. The batcher groups many events
+   * into mega-batches across pool pages automatically.
+   * During browser restart, requests are deferred and replayed after restart.
+   * Returns Promise<Array<{success, data?, error?, status}>>.
+   */
+  async submitRequests(requests) {
+    // During restart — queue for replay after browser is back (with 30s timeout)
+    if (this._isRestarting || !this.initialized || !this._batcher) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const idx = this._deferredQueue.findIndex(d => d.resolve === resolve);
+          if (idx !== -1) this._deferredQueue.splice(idx, 1);
+          reject(new Error('Deferred queue timeout — browser restart took too long'));
+        }, 30000);
+        this._deferredQueue.push({ requests, resolve, reject, timer });
+      });
+    }
+
+    // Track calls and trigger proxy rotation when threshold reached
+    this._requestsSinceRotation++;
+    if (this._requestsSinceRotation >= this._proxyRotationThreshold && !this._isRestarting) {
+      console.log(`[PagePool] ${this._requestsSinceRotation} requests since last rotation — rotating proxy`);
+      this._requestsSinceRotation = 0;
+      this._restartBrowser('proxy-rotation').catch(() => {});
+      // Queue this request for replay after restart (with 30s timeout)
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const idx = this._deferredQueue.findIndex(d => d.resolve === resolve);
+          if (idx !== -1) this._deferredQueue.splice(idx, 1);
+          reject(new Error('Deferred queue timeout — browser restart took too long'));
+        }, 30000);
+        this._deferredQueue.push({ requests, resolve, reject, timer });
+      });
+    }
+
+    return this._batcher.submit(requests);
+  }
+
+  async acquire(timeoutMs = 20000) {
+    if (!this.initialized || !this._browser?.isConnected()) {
+      throw new Error('Pool not initialized or browser disconnected');
+    }
+
+    if (this.available.length > 0) {
+      return this.available.pop();
+    }
+
+    // Wait for a page to be released
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = this.waiting.findIndex(w => w.resolve === resolve);
+        if (idx !== -1) this.waiting.splice(idx, 1);
+        reject(new Error('Page pool acquisition timeout'));
+      }, timeoutMs);
+      this.waiting.push({ resolve, timer });
+    });
+  }
+
+  release(page) {
+    if (!this.pages.includes(page)) return;
+    if (this.waiting.length > 0) {
+      const { resolve, timer } = this.waiting.shift();
+      clearTimeout(timer);
+      resolve(page);
+    } else {
+      this.available.push(page);
+    }
+  }
+
+  _removePage(page) {
+    let idx = this.pages.indexOf(page);
+    if (idx !== -1) this.pages.splice(idx, 1);
+    idx = this.available.indexOf(page);
+    if (idx !== -1) this.available.splice(idx, 1);
+
+    // Create replacement page and navigate before adding to pool
+    if (this._context) {
+      this._context.newPage().then(async (p) => {
+        try {
+          await p.goto('https://www.ticketmaster.com/', {
+            waitUntil: 'domcontentloaded',
+            timeout: 45000
+          });
+          if (p.url().includes('ticketmaster.com')) {
+            this.pages.push(p);
+            this.release(p);
+            console.log(`[PagePool] Replaced dead page, pool: ${this.pages.length}`);
+          } else {
+            p.close().catch(() => {});
+          }
+        } catch (e) {
+          console.warn(`[PagePool] Replacement page failed: ${e.message}`);
+          p.close().catch(() => {});
+        }
+      }).catch(() => {});
+    }
+  }
+
+  async cleanup() {
+    // Stop browser restart timer
+    if (this._refreshTimer) {
+      clearInterval(this._refreshTimer);
+      this._refreshTimer = null;
+    }
+
+    if (this._batcher) {
+      this._batcher.cleanup();
+      this._batcher = null;
+    }
+    for (const w of this.waiting) clearTimeout(w.timer);
+    this.waiting = [];
+
+    // Reject deferred requests
+    for (const { reject, timer } of this._deferredQueue) {
+      if (timer) clearTimeout(timer);
+      reject(new Error('Pool cleanup'));
+    }
+    this._deferredQueue = [];
+
+    await Promise.allSettled(this.pages.map(p => p.close().catch(() => {})));
+    this.pages = [];
+    this.available = [];
+    this.initialized = false;
+    this._initPromise = null;
+    this._isRestarting = false;
+  }
+
+  get stats() {
+    const cookieAgeMin = Math.round((Date.now() - this._lastCookieRefresh) / 60000);
+    return {
+      total: this.pages.length,
+      available: this.available.length,
+      inUse: this.pages.length - this.available.length,
+      waiting: this.waiting.length,
+      batcherQueue: this._batcher?.queue.length || 0,
+      activeFlushes: this._batcher?._activeFlushes || 0,
+      initialized: this.initialized,
+      cookieAgeMinutes: cookieAgeMin,
+      consecutiveErrors: this._consecutiveErrors,
+      isRestarting: this._isRestarting,
+      deferredQueue: this._deferredQueue.length
+    };
+  }
+}
+
+// Global page pool instance — 3 pages for parallel batching
+// 30 PM2 instances × 3 pages = 90 pages total, ~33 events/instance
+const browserPagePool = new BrowserPagePool(3);
+
+/**
+ * Clean up browser resources
+ */
+async function cleanup() {
+  // Clean up page pool first
+  await browserPagePool.cleanup();
+
+  // Clean up main browser
+  if (browser) {
+    try {
+      await browser.close();
+      browser = null;
+    } catch (error) {
+      console.warn("Error closing browser:", error.message);
+    }
+  }
+  
+  // Clean up API browser
+  await cleanupApiBrowser();
+}
+
+export {
+  initBrowser,
+  captureCookies,
+  refreshCookies,
+  loadCookiesFromFile,
+  saveCookiesToFile,
+  cleanup,
+  handleTicketmasterChallenge,
+  checkForTicketmasterChallenge,
+  enhancedFingerprint,
+  getRandomLocation,
+  getRealisticIphoneUserAgent,
+  generateAlternativeEventId,
+  simulateMobileInteractions,
+  // Browser-based API functions (bypass TLS fingerprinting)
+  initApiBrowserContext,
+  browserApiRequest,
+  cleanupApiBrowser,
+  isApiBrowserAvailable,
+  // Page pool for high-throughput parallel requests
+  browserPagePool
+};
